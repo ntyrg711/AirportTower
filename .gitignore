@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 .vscode/
+tile_cache/
+tempCodeRunnerFile.py
