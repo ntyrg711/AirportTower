@@ -58,7 +58,7 @@ class Aircraft:
         self.leg_progress = 0.0
 
         self.x, self.y = nodes[node_id]
-        self.speed = 0.5
+        self.speed = 0.1
         # 機体の向き(度)。0 = 右向き。前後の概念はこの角度で表現する。
         self.heading = heading
 
@@ -159,42 +159,121 @@ class Aircraft:
 
     def confirm_plan(self):
         """選択終了ボタンが押されたら、ためた計画を movement.py で確定し、
-        その結果(route)を実際の移動経路として反映する。"""
+        その結果(route)を実際の移動経路として反映する。
+
+        plan.confirm()はplan.cancel()を内部で呼んで revise フラグ含む
+        計画の状態をリセットしてしまうので、それより前に読み取っておく。"""
+        was_revise = self.plan.revise
         route = self.plan.confirm()
         if route is not None:
-            self.set_route(route)
+            self.set_route(route, revise=was_revise)
 
     def cancel_plan(self):
         """選択を確定せずに計画を破棄する(他機体を選び直した場合など)"""
         self.plan.cancel()
 
+    def hold_position(self):
+        """『今いる位置』をhold short状態として確定する(Hold Position)。
+
+        新しい状態表現や幾何計算は追加せず、movement.locate_current_position
+        が返すhold short時と同じ状態表現(current_node, approach_leg,
+        approach_progress, heading)への変換をそのまま利用する。これにより、
+        以降はContinue Taxi・ルート候補生成・confirm_plan・set_route・
+        resolve_route・bridge_from_approachといった既存のhold short再開の
+        仕組みが、通常の停止時と全く同じように動く。
+
+        1. 組み立て中の計画を破棄する。
+        2. self.legsが残っている(移動中、またはContinue Taxi/Reviseで
+           計画を組み立てている途中)場合のみ、現在のleg(self.legs[0])と
+           その中での進捗(self.leg_progress)から実際の物理位置を求め、
+           hold short中の機体が持つのと同じ属性
+           (current_node/approach_leg/approach_progress/heading)へ反映する。
+           entry_cornerは既存のhold short処理と同様、Aircraft側では保存
+           せず、_effective_entry_cornerがapproach_legのsegment構造
+           (node_x)から都度再導出するのに任せる。
+        3. self.legsが既に空(=既に完全に停止している)ならこの変換は不要
+           なので、そのままlegs/leg_progress/_final_stop_lengthを完全停止
+           状態にリセットするだけでよい。
+        4. plan.cancel()の後にplan.mark_hold_position()を呼び、次に
+           Continue Taxiが押されたときの最初のルート選択画面でだけ、
+           直近の交差点のHold Short選択肢を追加で出せるようにする
+           (movement.FlightPlan.mark_hold_position / get_reachable_routes
+           参照)。
+        """
+        self.plan.cancel()
+        self.plan.mark_hold_position()
+
+        if self.legs:
+            current_node, approach_leg, approach_progress, heading, _entry_corner = (
+                movement.locate_current_position(self.legs[0], self.leg_progress)
+            )
+            self.current_node = current_node
+            self.approach_leg = approach_leg
+            self.approach_progress = approach_progress
+            self.heading = heading
+
+        self.legs = []
+        self.leg_progress = 0.0
+        self._final_stop_length = None
+
     # --- 確定した経路を、実際の移動状態に反映する ---
 
-    def set_route(self, route):
+    def set_route(self, route, revise=False):
         """route: これから進むノードIDの並び(route[0]は、機体が
         既に停止していればcurrent_node、まだ現在のlegを移動中なら
-        そのlegを終えた先のノードを想定)。
+        そのlegを終えた先のノード、reviseの場合は今の物理位置から見て
+        まだコミットしていない直近のノードを想定)。
 
         まだ現在のlegを移動中(self.legsが残っている)場合は、
-        まずそのlegをapproach_leg/approach_progressとして確定させる
-        (_begin_replanで既に1leg分だけに切り詰め済みのはずなので、
-        単にそれを『待機中』の状態と同じ形に変換するだけでよい)。
-        これにより、停止中から指示された場合と全く同じ経路で
-        movement.resolve_routeに組み立てを任せられる。
+        まずそのlegをapproach_leg/approach_progressとして確定させる。
 
-        movement.resolve_route の結果(legs・向き・停止位置)を
-        自分の物理状態にそのまま反映する。『移動を開始する瞬間』
-        にだけ回転する。"""
+        - 通常(Continue Taxi等、revise=False): _begin_replanで既に
+          1leg分だけに切り詰め済みのはずなので、単にそれを『待機中』の
+          状態と同じ形に変換するだけでよい。
+        - revise=True: legsには一切触れていない(movement.FlightPlan.add
+          参照)ので、ここで初めて、確定した"今この瞬間"の実際の物理位置
+          (movement.locate_current_positionで今のleg_progressから求め
+          直す)を起点として採用する。plan構築中にため込んだ古い経路の
+          続き(self.legsの残り)はここで丸ごと捨てられる。
+
+        どちらの場合も、movement.resolve_route の結果(legs・向き・
+        停止位置)を自分の物理状態にそのまま反映する。『移動を開始する
+        瞬間』にだけ回転する。"""
         if self.legs:
-            _start_node, end_node, _segment, _seg_reversed = self.legs[0]
-            # legs[0]は既に(start_node, end_node, segment, reversed)の
-            # 4要素タプルなので、そのままapproach_legとして使い回せる。
-            self.approach_leg = self.legs[0]
-            self.approach_progress = self.leg_progress
-            self.current_node = end_node
+            if revise:
+                current_node, approach_leg, approach_progress, _heading, _entry_corner = (
+                    movement.locate_current_position(self.legs[0], self.leg_progress)
+                )
+                self.approach_leg = approach_leg
+                self.approach_progress = approach_progress
+                self.current_node = current_node
+            else:
+                _start_node, end_node, _segment, _seg_reversed = self.legs[0]
+                # legs[0]は既に(start_node, end_node, segment, reversed)の
+                # 4要素タプルなので、そのままapproach_legとして使い回せる。
+                self.approach_leg = self.legs[0]
+                self.approach_progress = self.leg_progress
+                self.current_node = end_node
             self.legs = []
             self.leg_progress = 0.0
             self._final_stop_length = None
+
+        if len(route) <= 1:
+            # route長1(=今乗っているTaxiWay自体、またはその
+            # hold short of X を選んで、新しいノードへは進まない
+            # まま確定した場合)。movement.resolve_route/
+            # build_movement_legsは2ノード未満のrouteからはleg
+            # (=区間)を作れないため、代わりに_begin_replanと同じ式
+            # (進入方向のフィレットの最も遠い点 + SAFE_DISTANCE)で、
+            # 今のapproach_leg上の『正しいhold short停止位置』まで
+            # 機体を進める。
+            #
+            # Hold Positionはボタンを押した瞬間の物理位置でそのまま
+            # 止めるだけ(SAFE_DISTANCEを踏まえた正式な停止位置とは
+            # 限らない)ので、ここで改めて正しい位置まで滑らかに
+            # 進める必要がある。
+            self._resume_to_safe_hold_short()
+            return
 
         resolution = movement.resolve_route(
             self.current_node,
@@ -211,6 +290,35 @@ class Aircraft:
         self.approach_progress = 0.0
         if resolution.heading is not None:
             self.heading = resolution.heading
+
+    def _resume_to_safe_hold_short(self):
+        """set_routeがroute長1(今乗っているTaxiWay自体を確定しただけ、
+        新しいノードへは進まない)を受け取ったときに呼ぶ。
+
+        self.approach_leg/self.approach_progress(このメソッドが
+        呼ばれる時点で、set_route冒頭のself.legsトリム処理により
+        必ず『待機中』の形に揃っている)から、_begin_replanと全く
+        同じ式で正しいhold short停止位置(natural_stop)を求め、
+        self.legsへ1leg分だけ差し戻して、通常のupdate()の移動
+        アニメーションでそこまで滑らかに進ませる(現在の進捗より
+        後退はさせない)。approach_legが無い(出発直後などで
+        まだ何のTaxiWayにも乗っていない)場合は何もしない。"""
+        approach_leg = self.approach_leg
+        if approach_leg is None:
+            return
+
+        approach_progress = self.approach_progress
+        _start_node, end_node, segment, _seg_reversed = approach_leg
+        approach_from_node = movement.leg_entry_node(approach_leg)
+        corner_trim = movement.get_max_incoming_corner_trim(end_node, approach_from_node)
+        stop_distance = corner_trim + SAFE_DISTANCE
+        natural_stop = max(0.0, segment.length - stop_distance)
+
+        self.legs = [approach_leg]
+        self.leg_progress = approach_progress
+        self._final_stop_length = max(natural_stop, approach_progress)
+        self.approach_leg = None
+        self.approach_progress = 0.0
 
     def update(self, aircrafts):
         if not self.legs:

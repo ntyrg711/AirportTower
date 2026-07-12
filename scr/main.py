@@ -53,6 +53,13 @@ while running:
 
                 for kind, rect, label, route in buttons:
                     if rect.collidepoint(mx, my):
+                        if kind == "continue_taxi":
+                            selected.plan.pass_gate()
+                        elif kind == "revise":
+                            selected.plan.start_revise()
+                        elif kind == "hold_position":
+                            # 現在地をhold short状態として確定する。
+                            selected.hold_position()
                         if kind == "route":
                             # TaxiWayを選ぶ = 実際には動かさずキューに追加するだけ
                             selected.add_to_plan(route)
@@ -118,6 +125,10 @@ while running:
             color = (60, 130, 70)
         elif kind == "hold_short":
             color = (150, 100, 30)
+        elif kind == "revise":
+            color = (150, 40, 40)
+        elif kind == "hold_position":
+            color = (100, 60, 130)
         else:
             color = (80, 80, 80)
         pygame.draw.rect(screen, color, rect)

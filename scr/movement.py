@@ -195,12 +195,22 @@ def build_movement_legs(route, entry_leg=None, entry_progress=0.0):
     (leg_entry_node(entry_leg))とroute[0]を結ぶ実際の地図の辺
     (get_segment)の中に収まっているかどうかを確認する。
     entry_legがCornerSegmentのチェーンであっても、その末尾(leg3)は
-    必ずget_segment(via, next_node)そのものなので、収まっている場合は
-    幾何学的に完全に同一であり、entry_leg自体(はるか昔の履歴込み)を
-    捨てて、直前ノードを新たな起点とする『素の』route(通常の
-    先読み・結合ロジック)にそのまま合流させてよい。収まっていない場合
-    (まだ本当にentry_leg全体の途中、つまり古い区間を移動中)は、
-    従来通りentry_leg自体を先頭に維持し、warpを避ける。
+    必ずget_segment(via, next_node)そのものなので、entry_progressが
+    実際にそのleg3(フィレットを通過し終えた後の生の辺の部分)まで
+    進んでいれば、幾何学的に完全に同一であり、entry_leg自体(はるか
+    昔の履歴込み)を捨てて、直前ノードを新たな起点とする『素の』route
+    (通常の先読み・結合ロジック)にそのまま合流させてよい。
+
+    重要なのは、この置き換えが安全なのは「距離(remaining)が収まって
+    いるかどうか」だけでなく、実際に entry_progress がleg3(生の辺の
+    部分)に到達しているかどうかも必要な点。entry_legがまだ
+    leg1(直進区間)やfillet(曲線区間)の途中にある場合、そこはlocal_edge
+    (直前ノード-route[0]間の生の辺)とは全く別の形状なので、たとえ
+    残り距離だけが収まって見えても置き換えてはいけない(置き換えると、
+    実際のカーブ上の位置とは無関係な、local_edge上のどこかへ座標が
+    ワープしてしまう)。この場合(まだ本当にentry_leg全体の途中、
+    つまり古い区間を移動中)は、従来通りentry_leg自体を先頭に維持し、
+    warpを避ける。
 
     各legは (start_node, end_node, segment, reversed) のタプル。
     reversedは、segment.point_and_heading(distance, reversed=reversed)を
@@ -218,11 +228,26 @@ def build_movement_legs(route, entry_leg=None, entry_progress=0.0):
         local_edge = get_segment(entry_node, route[0])
         remaining = entry_leg[2].length - entry_progress
 
-        if remaining <= local_edge.length + 1e-6:
-            # 今いる場所はentry_node-route[0]間のローカルな辺の中に
-            # 収まっている。entry_leg(はるか昔の履歴)を捨てて、
-            # 直前ノードを先頭に継ぎ足した『素のroute』として
-            # 以降の通常ロジックにそのまま合流させる。
+        # entry_legが交差点のフィレット(CornerSegment)の場合、その末尾
+        # (leg3)は必ずlocal_edgeそのものと幾何学的に一致するが、
+        # leg1(直進区間)やfillet(曲線区間)はlocal_edgeとは全く別の形状
+        # なので、そこに位置している間は「距離が収まっているかどうか」
+        # だけでは同一視できない。entry_progressが実際にleg3(フィレット
+        # を通過し終えた後の生の辺の部分)まで進んでいるかを、形状ごと
+        # 確認してから判定する。
+        entry_segment = entry_leg[2]
+        if hasattr(entry_segment, "leg1_length"):
+            on_raw_tail = entry_progress > entry_segment.leg1_length + entry_segment.fillet.length + 1e-9
+        else:
+            # entry_leg自体がもともと生のSegment(角なし)なので、local_edge
+            # と同一の辺の上にいる。
+            on_raw_tail = True
+
+        if on_raw_tail and remaining <= local_edge.length + 1e-6:
+            # 今いる場所はentry_node-route[0]間のローカルな生の辺の中に
+            # 収まっている(かつ実際にその辺の形状の上にいる)。entry_leg
+            # (はるか昔の履歴)を捨てて、直前ノードを先頭に継ぎ足した
+            # 『素のroute』として以降の通常ロジックにそのまま合流させる。
             entry_leg = None
             start_progress = local_edge.length - remaining
             route = [entry_node] + list(route)
@@ -556,6 +581,73 @@ def leg_entry_node(leg):
     return getattr(segment, "node_x", start_node)
 
 
+def locate_current_position(leg, progress):
+    """leg (start_node, end_node, segment, reversed) を progress(そのlegの
+    start_node起点の弧長)だけ進んだ、実際の物理的な『今いる場所』を、
+    hold short中の機体が持つのと同じ形(current_node, approach_leg,
+    approach_progress)に変換して返す。あわせて、その位置での向き
+    (heading)と、直前に実際に使ったフィレットのcorner_segmentsキー
+    (entry_corner。無ければNone)も返す。
+
+    legが交差点をまたいだ複合カーブ(CornerSegmentのチェーン)の場合、
+    外側(routeの終点に近い側)から内側(起点に近い側)へ辿り、
+    まだそのフィレットの手前(=そのフィレットの向きがまだ確定していない)
+    である間はさらに内側へ潜っていく。あるフィレットの中、またはその先
+    (もうそのフィレットは通過確定済み)まで進んでいたら、そこで停止し、
+    そのフィレットの出口ノード(node_b)を『まだ選び直せる直近のノード』
+    として返す。どの階層でもフィレットに一切入っていなければ(生の
+    Segmentまで潜り切ったら)、その生の辺の進行方向側のノードを返す。
+
+    戻り値の(current_node, approach_leg, approach_progress)は、実際に
+    その位置で機体が停止した場合の状態と完全に同じ形なので、
+    get_reachable_routes_from・bridge_from_approach・resolve_route等、
+    hold short時に使っている既存の仕組みへそのまま渡せる。これにより、
+    『移動中の任意の時点を、hold short時と同じ状態表現に変換する』
+    という変換として、Revise以外の将来の機能(その場で停止して
+    ルートを再検索する、等)にもそのまま使い回せる。"""
+    _start_node, _end_node, top_segment, top_reversed = leg
+    _, heading = top_segment.point_and_heading(progress, reversed=top_reversed)
+
+    def descend(segment, distance, reversed_flag):
+        via = getattr(segment, "node_x", None)
+        if via is None:
+            # 生のSegment。まだどのフィレットにも入っていない。
+            if not reversed_flag:
+                near_node, far_node = segment.node_a, segment.node_b
+            else:
+                near_node, far_node = segment.node_b, segment.node_a
+            approach_leg = (near_node, far_node, segment, reversed_flag)
+            return far_node, approach_leg, distance, None
+
+        # CornerSegmentの内部は常にY->X->Z(edge_yx->fillet->edge_xz)の
+        # 向きで構築されているので、distance/reversed_flagを、この
+        # セグメント自身の内部の弧長(Yを起点にした順方向)へ変換する。
+        x = distance if not reversed_flag else segment.length - distance
+
+        if x <= segment.leg1_length:
+            # まだこの角(via)のフィレットの手前。もっと内側(より早い
+            # 角、または生の辺)へ潜って続きを探す。
+            return descend(segment.edge_yx, x, segment.yx_reversed)
+
+        # この角(via)のフィレットの中、またはその先まで進んでいる
+        # =この角は既にコミット済み。次に選び直せるのはこの角の
+        # 出口ノード(node_b)。
+        edge_yx = segment.edge_yx
+        y1 = getattr(edge_yx, "node_x", None)
+        if y1 is None:
+            y1 = edge_yx.node_a if edge_yx.node_a != via else edge_yx.node_b
+
+        approach_leg = (y1, segment.node_b, segment, False)
+        entry_key = (via, y1, segment.node_b)
+        entry_corner = entry_key if entry_key in corner_segments else None
+        return segment.node_b, approach_leg, x, entry_corner
+
+    current_node, approach_leg, approach_progress, entry_corner = descend(
+        top_segment, progress, top_reversed
+    )
+    return current_node, approach_leg, approach_progress, heading, entry_corner
+
+
 def _effective_planning_state(aircraft):
     """次の指示の選択肢を組み立てるための基準
     (node, heading, exclude_prev, approach_remaining)を、
@@ -573,7 +665,8 @@ def _effective_planning_state(aircraft):
         start_node, end_node, segment, seg_reversed = aircraft.legs[0]
         remaining = segment.length - aircraft.leg_progress
         _, heading = segment.point_and_heading(segment.length, reversed=seg_reversed)
-        return end_node, heading, start_node, remaining
+        exclude_prev = leg_entry_node(aircraft.legs[0])
+        return end_node, heading, exclude_prev, remaining
 
     return (
         aircraft.current_node,
@@ -635,6 +728,15 @@ def get_reachable_routes(aircraft):
         tail = plan.path[-1]
         heading = plan.heading
         prev_node = plan.path[-2] if len(plan.path) > 1 else None
+        if prev_node is None and plan.last_ride_route and len(plan.last_ride_route) > 1 and plan.last_ride_route[-1] == tail:
+            # plan.pathがまだ1要素(=第1画面で「今乗っているTaxiWay自体」
+            # を選んだ直後で、まだそこから何も曲がっていない状態)の場合、
+            # 「来た方向」の情報はself.pathには乗せられない(乗せると、
+            # confirm時にroute[0]が実際の現在地と一致しなくなり、
+            # resolve_route側でbridgeできず機体が一瞬back-warpする別の
+            # バグになる)。その代わりlast_ride_route側に残っている
+            # ので、そちらから補って「戻る方向」を除外する。
+            prev_node = plan.last_ride_route[-2]
 
         # get_turn_options_along_ride(hold_short付き)を先に入れておくことで、
         # 末端ノード(=別TaxiWayとの交差点そのものが終点になっている場合)
@@ -672,13 +774,49 @@ def get_reachable_routes(aircraft):
 
         return deduped
 
-    node, heading, exclude_prev, approach_remaining = _effective_planning_state(aircraft)
+    if plan.revise and aircraft.legs:
+        # Revise: 今の物理位置から見て、まだコミットしていない直近の
+        # ノードを基準に検索する(Continue Taxiのように今のleg全体の
+        # 終点=予約先を基準にはしない)。
+        node, approach_leg, approach_progress, heading, entry_corner = (
+            locate_current_position(aircraft.legs[0], aircraft.leg_progress)
+        )
+        exclude_prev = leg_entry_node(approach_leg)
+        approach_remaining = approach_leg[2].length - approach_progress
+    else:
+        node, heading, exclude_prev, approach_remaining = _effective_planning_state(aircraft)
+        entry_corner = _effective_entry_corner(aircraft)
+
     continue_routes = get_reachable_routes_from(
         node,
         heading,
         exclude_prev=exclude_prev,
         approach_remaining=approach_remaining,
+        entry_corner=entry_corner,
     )
+
+    if plan.pending_first_screen_hold_short and exclude_prev is not None:
+        # Revise後、またはHold Position後の「最初のルート選択画面」
+        # だけの特例: 次のTaxiWayへの候補を並べるのではなく、今まさに
+        # 乗っているTaxiWay自体を、その本当の終点まで一気に進んだ
+        # 1本のルートとして候補に出す(get_full_ride)。
+        #
+        # これを選ぶと、次の画面は(last_ride_routeを介して)
+        # get_turn_options_along_rideがそのまま使われる。この関数は
+        # 元々「rideの終点(route[-1])も、そこで別のTaxiWayへ曲がれる
+        # 場所として対象に含める」設計になっているため、Mのように
+        # 短いTaxiWayでも、その終点(=次のTaxiWayとの交差点)での
+        # 「曲がる」「hold short of X」の両方が新しい探索ロジックなしで
+        # 自動的に出てくる。
+        #
+        # (以前の実装は、この終点[node]自体をhold shortの停止位置
+        # として扱おうとしたが、nodeは既に「実質到達済み」の論理位置
+        # として扱われるため、そこより手前で止まるという選択肢は
+        # そもそもこの経路システムには存在しない。正しくは、Mを選んだ
+        # 「次の」画面でM1側にhold shortをかける、という形になる。)
+        taxiway_name, current_ride_route = get_full_ride(exclude_prev, node)
+        return [(taxiway_name, current_ride_route, None)]
+
     return [(name, route, None) for name, route in continue_routes]
 
 
@@ -717,30 +855,57 @@ def get_destination_buttons(selected):
     #                  手前で止まる。hold_shortボタンとの違いは
     #                  「今乗っているTaxiWayの途中で早めに止まるか、
     #                  最後まで乗るか」という経路の選び方だけ。)
-    buttons = []
-    routes = get_reachable_routes(selected)
+    if selected is None:
+        return []
 
-    y = 100
-    for taxiway_name, route, hold_short_route in routes:
-        route_rect = pygame.Rect(600, y, 170, 30)
-        buttons.append(("route", route_rect, taxiway_name, route))
-        y += 35
+    # Revise中、機体の状況が変わって前提が崩れていたら計画を破棄する。
+    # ここで破棄されればgate_passedもFalseに戻るので、下の分岐で
+    # 自然に1ページ目のボタンに戻る。
+    selected.plan.refresh()
 
-        if hold_short_route is not None:
-            hold_rect = pygame.Rect(600, y, 170, 30)
-            hold_label = f"hold short of {taxiway_name}"
-            buttons.append(("hold_short", hold_rect, hold_label, hold_short_route))
+    if not selected.plan.gate_passed:
+        # 1ページ目: Continue Taxi(今のルートの末端からの予約)。
+        # 移動中(=まだ現在のlegを進行中)であれば、それに加えて
+        # Revise(今の物理位置から見直して、今のルートを取りやめて
+        # 別ルートへ変更する)も選べるようにする。
+        y = 100
+        continue_rect = pygame.Rect(600, y, 170, 30)
+        buttons = [("continue_taxi", continue_rect, "Continue Taxi", None)]
+        if selected.legs:
+            y += 35
+            revise_rect = pygame.Rect(600, y, 170, 30)
+            buttons.append(("revise", revise_rect, "Revise", None))
+    else:
+        buttons = []
+        routes = get_reachable_routes(selected)
+
+        y = 100
+        for taxiway_name, route, hold_short_route in routes:
+            route_rect = pygame.Rect(600, y, 170, 30)
+            buttons.append(("route", route_rect, taxiway_name, route))
             y += 35
 
-        y += 5  # ルートごとの区切りの余白
+            if hold_short_route is not None:
+                hold_rect = pygame.Rect(600, y, 170, 30)
+                hold_label = f"hold short of {taxiway_name}"
+                buttons.append(("hold_short", hold_rect, hold_label, hold_short_route))
+                y += 35
 
-    if selected is not None and selected.plan.active:
-        # 選択終了ボタン。ここまでにためた計画をそのまま移動経路として確定する。
-        # 機体が移動中(まだ現在のlegを進行中)でも計画を組み立てられるように
-        # なったため、target_nodeではなくplan.active(計画が積まれているか)
-        # で判定する。
-        finish_rect = pygame.Rect(600, y + 10, 170, 30)
-        buttons.append(("finish", finish_rect, "Done", None))
+            y += 5  # ルートごとの区切りの余白
+
+        if selected.plan.active:
+            # 選択終了ボタン。ここまでにためた計画をそのまま移動経路として確定する。
+            # 機体が移動中(まだ現在のlegを進行中)でも計画を組み立てられるように
+            # なったため、target_nodeではなくplan.active(計画が積まれているか)
+            # で判定する。
+            finish_rect = pygame.Rect(600, y + 10, 170, 30)
+            buttons.append(("finish", finish_rect, "Done", None))
+
+    # Hold Position: ページ(1ページ目/2ページ目)に関わらず常時表示する、
+    # ルート候補ボタンとは別枠の固定位置のボタン。押すと現在地で
+    # hold short状態に確定する(Aircraft.hold_position参照)。
+    hold_position_rect = pygame.Rect(600, 20, 170, 30)
+    buttons.append(("hold_position", hold_position_rect, "Hold Position", None))
 
     return buttons
 
@@ -863,10 +1028,80 @@ class FlightPlan:
         # 経路)。get_reachable_routesが、この経路の途中の交差点で
         # 曲がれる場所を選択肢として出すために使う。
         self.last_ride_route = None
+        self.gate_passed = False
+
+        # True の間は「Revise」セッション中であることを表す。
+        # Continue Taxi(pass_gate)との違いは、path[0]をどう決めるか
+        # (leg完走後の予約先か、今の物理位置から見た直近の未確定ノードか)
+        # と、機体側のlegsを一切トリム/破棄しない(confirmされるまで
+        # 実体には触れない)点。
+        self.revise = False
+
+        # True の間は、次に表示される「最初のルート選択画面」
+        # (Revise後、またはHold Position後に初めてContinue Taxiを
+        # 押した直後の画面)であることを表す。この画面だけは、
+        # 通常のContinue Taxi後の画面と違い、直近の交差点についても
+        # 「そのまま進む」に加えて「その交差点のHold Shortで停止する」
+        # 選択肢を出す(get_reachable_routes参照)。
+        # 最初の選択(add)が行われた時点で意味を失うのでクリアする。
+        self.pending_first_screen_hold_short = False
+
+    def pass_gate(self):
+        """1ページ目の「Continue Taxi」が押されたときに呼ぶ。
+        以降このセッション中は通常の経路選択肢(2ページ目、今のルートの
+        末端からの予約)が表示されるようになる。
+        pending_first_screen_hold_shortはここでは変更しない
+        (Hold Position直後にContinue Taxiが押された場合だけ、
+        mark_hold_positionで立てたフラグをそのまま持ち越して
+        次の画面で使うため)。"""
+        self.gate_passed = True
+        self.revise = False
+
+    def start_revise(self):
+        """移動中に「Revise」が押されたときに呼ぶ。Continue Taxiと
+        同じ2ページ目のUIを共有するが、path[0]を決める基準
+        (movement.locate_current_position)と、確定時の反映のしかたが
+        異なる(FlightPlan.add/Aircraft.set_route参照)。"""
+        self.gate_passed = True
+        self.revise = True
+        self.pending_first_screen_hold_short = True
+
+    def mark_hold_position(self):
+        """Hold Positionが確定した直後に呼ぶ(Aircraft.hold_position
+        参照)。plan.cancel()で1ページ目に戻った後、次にContinue Taxi
+        が押されたときの最初のルート選択画面でだけ、直近の交差点の
+        Hold Short選択肢を追加で出せるようにする。"""
+        self.pending_first_screen_hold_short = True
 
     @property
     def active(self):
         return self.path is not None
+
+    def refresh(self):
+        """Revise中、機体の物理的な状況が変わって前提が崩れていないかを
+        毎フレーム確認する。
+
+        Reviseはaircraft.legsを一切トリムしないため、機体は選択中も
+        今までのルート通り進み続ける。もし
+          - legsが尽きて完全に停止してしまった(=もう選び直す途中地点が
+            無くなった)
+          - path[0]として選んだ『直近の未確定ノード』を、機体が実際に
+            通過(コミット)してしまった
+        場合、それまで組み立てていた計画はもう意味を持たないため、
+        丸ごと破棄する(cancel)。これにより2ページ目のボタンは自然に
+        消え、1ページ目(Continue Taxi / Revise)に戻る。"""
+        if not self.revise or not self.gate_passed:
+            return
+        owner = self.owner
+        if not owner.legs:
+            self.cancel()
+            return
+        if self.path is not None:
+            anchor, _approach_leg, _progress, _heading, _entry_corner = (
+                locate_current_position(owner.legs[0], owner.leg_progress)
+            )
+            if anchor != self.path[0]:
+                self.cancel()
 
     def add(self, route):
         """選んだルート(route)を計画(キュー)に追加する。
@@ -879,6 +1114,14 @@ class FlightPlan:
         曲がる選択肢を選んだ場合)は、計画のうちその交差点より先を
         切り詰めてから、新しいルートを繋げる。
 
+        例外として、Revise後/Hold Position後の最初の画面で「今乗って
+        いるTaxiWay自体」を選んだ場合に生まれるroute(get_full_ride
+        の都合上、route[0]が実際の現在地ではなくその1つ手前の
+        exclude_prevになっている)や、それを起点に得られる
+        hold_shortルートは、route[0]自体はself.pathに存在しない。
+        この場合はroute[1](=実際の現在地)を代わりの基準点として
+        使う。詳細はメソッド内のコメントを参照。
+
         まだ計画を開始していなければここで開始する。機体がまだ現在の
         legを移動中の場合、owner._begin_replan()でそのlegだけを残して
         先の(古い経路の)legsを打ち切り、_effective_planning_stateで
@@ -889,22 +1132,70 @@ class FlightPlan:
         owner = self.owner
 
         if self.path is None:
-            owner._begin_replan()
-            node, heading, _exclude_prev, _remaining = _effective_planning_state(owner)
+            if self.revise:
+                # Reviseはowner.legsに一切触れない(確定するまで実体は
+                # 今までのルート通り進み続ける)。起点は「今の物理位置
+                # から見て、まだコミットしていない直近のノード」。
+                node, _approach_leg, _progress, heading, _entry_corner = (
+                    locate_current_position(owner.legs[0], owner.leg_progress)
+                )
+            else:
+                owner._begin_replan()
+                node, heading, _exclude_prev, _remaining = _effective_planning_state(owner)
             self.path = [node]
             self.heading = heading
+            # 注意: ここでpending_first_screen_hold_shortをクリアしては
+            # いけない。get_reachable_routesはself.pathがNoneのときだけ
+            # このフラグを参照する(self.pathが埋まった以降の画面は
+            # get_turn_options_along_ride側の仕組みがそのままHold Short
+            # 選択肢を出すので、この時点ではどのみち参照されない)。
+            # にもかかわらずここで先にFalseへクリアしてしまうと、この
+            # 計画がconfirm()まで至らずcancel()で破棄された場合(例:
+            # 選択肢を1つ選んだ直後に他の機体を選び直した、または空欄を
+            # クリックして選択解除した場合)、機体の物理的な状態
+            # (Hold Position/Reviseで止まったままTaxiWayの途中にいる
+            # こと自体)は何も変わっていないのに、次にContinue Taxiを
+            # 押したときの最初の画面で今乗っているTaxiWayの選択肢が
+            # 二度と出てこなくなってしまう。実際にこのフラグが不要に
+            # なるのは、計画がconfirm()され機体が本当に動き出した
+            # (=物理的な状態が変わった)時点なので、クリアはconfirm()
+            # 側で行う。
 
-        if route[0] != self.path[-1] and route[0] in self.path:
+        # route[0]をself.pathの中の対応する位置(anchor)に結びつけて、
+        # 「そのanchorより先を切り詰めてから、続きを繋げる」という
+        # 単一の処理に統一する。
+        #
+        # 通常はroute[0]自体がself.pathのどこか(多くの場合は末尾)に
+        # 一致するので、それをそのままanchorとして使う(offset=1、
+        # route[1:]をpathへ足す)。
+        #
+        # 唯一の例外が、Revise後/Hold Position後の最初の画面で
+        # 「今乗っているTaxiWay自体」を選んだ場合に生まれるrouteと、
+        # それ由来のturn/hold_shortルート。これらはroute[0]が
+        # 実際の現在地ノードではなく、その1つ手前(exclude_prev、
+        # 既にcommit済みで、そもそもself.pathには含まれないノード)
+        # になっている。この場合はroute[1](=実際の現在地。必ず
+        # self.pathのどこかに存在する)をanchorとして使い、route[2:]
+        # をpathへ足す(offset=2)。
+        anchor = route[0]
+        anchor_offset = 1
+        if anchor not in self.path and len(route) > 1 and route[1] in self.path:
+            anchor = route[1]
+            anchor_offset = 2
+
+        if anchor == self.path[-1]:
+            self.path.extend(route[anchor_offset:])
+        else:
             # 末尾からさかのぼって最後に出現した位置を探し、そこまで切り詰める
             trim_index = None
             for idx in range(len(self.path) - 1, -1, -1):
-                if self.path[idx] == route[0]:
+                if self.path[idx] == anchor:
                     trim_index = idx
                     break
             if trim_index is not None:
                 self.path = self.path[: trim_index + 1]
+            self.path.extend(route[anchor_offset:])
 
-        self.path.extend(route[1:])
         # このルート自体が、次の画面で「途中の交差点で曲がれる場所」を
         # 探すための基準(last_ride_route)になる
         self.last_ride_route = route
@@ -912,26 +1203,65 @@ class FlightPlan:
         legs, _start_progress = bridge_from_approach(
             owner.current_node, owner.approach_leg, owner.approach_progress, self.path
         )
-        _last_start, _last_end, last_segment, last_reversed = legs[-1]
-        _, heading = last_segment.point_and_heading(last_segment.length, reversed=last_reversed)
-        self.heading = heading
+        if legs:
+            # self.pathが2要素以上あり、実際に新しく進むlegが1つ以上
+            # 生成された場合だけ、その最後のlegの出口の向きに更新する。
+            _last_start, _last_end, last_segment, last_reversed = legs[-1]
+            _, heading = last_segment.point_and_heading(last_segment.length, reversed=last_reversed)
+            self.heading = heading
+        # legsが空(self.pathが1要素のみ、つまり「今乗っているTaxiWay自体を
+        # 選んだだけでまだどこにも進んでいない」場合)は、build_movement_legs
+        # 側の「entry_leg合流」処理がroute長2未満では走らないため何も
+        # 返らない。この場合self.headingは既に上で計算済みの値(現在地
+        # での向き)のままでよいので、そのまま何もしない。
 
     def confirm(self):
         """選択終了ボタンが押されたら、ためた計画を確定する。
         route を返す(呼び出し側がこれを Aircraft.set_routeに渡して
         実際の移動を開始させる)。計画が無ければNoneを返す。
-        呼び出し後、内部状態はリセットされる。"""
+        呼び出し後、内部状態はリセットされる。
+
+        self.pathが1要素だけの場合(第1画面で「今乗っているTaxiWay
+        自体」を選んだ、または直後に「hold short of X」を選んだ場合)
+        も、長さ1のrouteとしてそのまま返す。これは新しいノードへは
+        進まないが、Hold Positionで止まった位置がまだ正式な
+        hold short位置(SAFE_DISTANCE手前)ちょうどとは限らないため、
+        Aircraft.set_route側でそこまで機体を進める処理が必要になる
+        (movement.resolve_routeはroute長2未満からはlegを作れない
+        ため、ここでは何もしないのが正しいわけではない)。"""
         result = None
-        if self.path and len(self.path) > 1:
+        if self.path:
             result = list(self.path)
         self.cancel()
+        if result is not None:
+            # 実際に計画が確定し、機体がこれから物理的に動き出す
+            # (Aircraft.set_routeが呼ばれる)場合だけ、Hold Position/
+            # Reviseに由来する『今乗っているTaxiWayの選択肢を出す』
+            # 状態を消費し尽くしたことにする。単に計画を組み立てて
+            # 破棄しただけ(cancel()経由)ではここに来ないので、
+            # 物理的な状態が変わっていない限りフラグは残り続ける。
+            self.pending_first_screen_hold_short = False
         return result
 
     def cancel(self):
-        """選択を確定せずに計画を破棄する(他機体を選び直した場合など)"""
+        """選択を確定せずに計画を破棄する(他機体を選び直した場合など)。
+        次にこの機体へ指示を出すときは、必ずまた1ページ目
+        (Continue Taxi)から始まるようにgate_passedもリセットする。
+
+        pending_first_screen_hold_shortはここではリセットしない。
+        このフラグはHold Position/Reviseで止まった際の『物理的な状態』
+        (今まさにTaxiWayの途中にいる)を表すもので、add()で実際に
+        選択肢を1つ選んだ瞬間に初めて消費・クリアされる(add参照)。
+        ここでcancel()のたびに毎回リセットしてしまうと、何も選ばずに
+        単に選択解除しただけ(他機体をクリック/空クリックで選択を
+        外した場合など)でもフラグが失われ、再選択してContinue Taxi
+        を押したときに今乗っているTaxiWayの選択肢が出なくなってしまう
+        (実際の位置は何も変わっていないのに)。"""
         self.path = None
         self.heading = None
         self.last_ride_route = None
+        self.gate_passed = False
+        self.revise = False
 
 
 def build_preview_legs(aircraft):
@@ -953,3 +1283,48 @@ def build_preview_legs(aircraft):
         aircraft.current_node, aircraft.approach_leg, aircraft.approach_progress, plan.path
     )
     return legs
+
+def _effective_entry_corner(aircraft):
+    """_effective_planning_state が返す基準ノードへの到着で、実際に
+    フィレット(角)を使ったかどうかを corner_segments のキーとして返す。
+
+    plan.path がまだ無い(=何も計画を積み増していない)状態で
+    get_reachable_routes が選択肢を組み立てる際、直前に使ったフィレットと
+    物理的に連結できない角を弾けるようにするためのもの。_incoming_corner
+    が plan.path をベースに行っているのと同じ判定を、まだ計画が無い
+    (停止中/移動中どちらもありうる)状態向けに行う。
+
+    aircraft.legs[0](移動中)または aircraft.approach_leg(停止中)の
+    segment が CornerSegment であれば、そこで実際に使われた最後の角の
+    キー (via, y1, to_node) を返す。via は leg_entry_node と同じく
+    segment.node_x(ノードIDの再照合なしに求まる、直近に曲がった角)。
+    y1(そのviaへ入ってきた直前のノード)は、CornerSegment.edge_yx を
+    1段だけ辿って求める:
+      - edge_yx 自体が CornerSegment(さらに前の角を含むチェーン)なら、
+        その node_x が y1(その角も自分で組み立てた際に構造的に
+        確定させたものなので、ここでもID比較は発生しない)。
+      - edge_yx が生の Segment(両端ノードIDが必ず異なる)なら、
+        via ではない方の端点が y1(ここでのID比較は生の1区間に対して
+        だけなので安全)。
+
+    まだ一度もフィレットを使っていない(segment が生のSegmentのまま)場合や、
+    今のところ計画も何も進行中のlegも無い場合はNoneを返す。"""
+    if aircraft.legs:
+        leg = aircraft.legs[0]
+    elif aircraft.approach_leg is not None:
+        leg = aircraft.approach_leg
+    else:
+        return None
+
+    _start_node, to_node, segment, _seg_reversed = leg
+    via = getattr(segment, "node_x", None)
+    if via is None:
+        return None  # 生のSegment。まだ角を使っていない
+
+    edge_yx = segment.edge_yx
+    y1 = getattr(edge_yx, "node_x", None)
+    if y1 is None:
+        y1 = edge_yx.node_a if edge_yx.node_a != via else edge_yx.node_b
+
+    key = (via, y1, to_node)
+    return key if key in corner_segments else None
